@@ -1,0 +1,114 @@
+Create citation from PDF
+Rename PDF
+
+pdfinfo -> title, author, year, journal, volume, page, DOI
+DOI -> lookup on crossref to get xml citation info
+
+Minimal Functionality
+=====================
+I want something I can hack together quickly and see if I get any use out of 
+it.  The minimal set of features I need for this is:
+
+1. Program that downloads PDFs and asks for citation info.  A framework should 
+   be in place for auto-filling in fields.
+
+2. Program that shows all downloaded pdfs and can open them in evince.  There 
+   should be the ability to filter by tags.
+
+What if I could make graphs?  That is, draw edges between papers and label the 
+edges however I like.  The easy GUI is to show all connections when the 
+reference is expanded.  But I could also actually make graphs later on.
+
+GUI requirements:
+
+1. List of citations
+2. Ability to assign citations to projects/keywords.
+3. Show details for selected paper, i.e. help the user find the paper they want 
+   to read.  
+4. Add projects/keywords.
+
+I think I only need two panels:
+
+1. Brief info for all references in active project
+2. Detailed information for selected reference.
+
+You can double click on paper to get the menu where you can edit projects, 
+citation info, etc.
+
+All PDFS in one "database" directory.  Not necessarily flat.  Need an actual 
+database to store citation info in.  Should be something open and useful.
+
+I can use bibtex as a database.  There seems to be a nice python package for 
+reading and writing bibtex.
+
+So, on installation:
+
+$ mkdir ~/.local/share/openref/
+$ touch ~/.local/share/openref/citations.bib
+$ mkdir ~/.local/share/openref/pdfs/
+$ mkdir ~/.local/share/openref/plugins/
+
+How do I link the same document to multiple different categories?
+
+Use the "file" field in bibtex to link citations to files.  A citation can have 
+any number of files (i.e. so books can be cited or supplemental info can be 
+downloaded and linked).
+
+It looks like bibtex fields can be anything.  Unrecognized fields are just 
+ignored by latex.  So I can have a single citation file, and use a keyword 
+field to keep track of how I should display the entries.
+
+Mendeley's useful features
+==========================
+1. easily download from web
+2. automatically extract references
+
+Reproducing those features
+==========================
+1. Use my program to "open" pdf after downloading.  It tries to fill in as much 
+   citation info as possible, asks you for the rest.  Everything is saved, and 
+   then it opens up the PDF for real in the end.
+
+2. Do the best I can using a flexible architecture to support different rules 
+   for different journals.  That is, I'll try to detect the journal and then go 
+   from there.  It should be easy to hack together plugins for new journals.
+
+Sample code
+===========
+from pdfminer.pdfparser import PDFParser
+from pdfminer.pdfdocument import PDFDocument
+
+fp = open('diveintopython.pdf', 'rb')
+parser = PDFParser(fp)
+doc = PDFDocument()
+parser.set_document(doc)
+doc.set_parser(parser)
+doc.initialize()
+
+print doc.info
+
+>>> [{'CreationDate': 'D:20040520151901-0500',
+  'Creator': 'DocBook XSL Stylesheets V1.52.2',
+  'Keywords': 'Python, Dive Into Python, tutorial, object-oriented, programming, documentation, book, free',
+  'Producer': 'htmldoc 1.8.23 Copyright 1997-2002 Easy Software Products, All Rights Reserved.',
+  'Title': 'Dive Into Python'}]
+
+import bibtexparser
+
+with open('bibtex.bib') as bibtex_file:
+    bib_database = bibtexparser.load(bibtex_file)
+
+print bib_database
+
+>>> [{'journal': 'Nice Journal',
+  'comments': 'A comment',
+  'pages': '12--23',
+  'month': 'jan',
+  'abstract': 'This is an abstract. This line should be long enough to test\nmultilines...',
+  'title': 'An amazing title',
+  'year': '2013',
+  'volume': '12',
+  'id': 'Cesar2013',
+  'author': 'Jean César',
+  'keyword': 'keyword1, keyword2',
+  'type': 'article'}]

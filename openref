@@ -1,0 +1,634 @@
+#!/home/kale/research/software/projects/openref/env/bin/python2
+
+"""\
+Manage references...
+
+Usage:
+    openref [<pdf>]
+"""
+
+import os, sys, pprint, collections, glob, utils 
+import pygtk; pygtk.require('2.0'); import gtk, gobject, pango
+
+DATA_DIR = os.path.join(os.path.expanduser('~'), '.local/share/openref')
+BIBTEX_FILE = os.path.join(DATA_DIR, 'citations.bib')
+PDF_DIR = os.path.join(DATA_DIR, 'pdfs')
+PLUGIN_DIR = os.path.join(DATA_DIR, 'plugins')
+PLUGIN_GLOB = os.path.join(PLUGIN_DIR, '*.py')
+
+class Citation (object):
+
+    def __init__(self, dict=None):
+        self.dict = dict or {'type': 'article'}
+        self._current_id = self.dict.get('id')
+        self._current_file = self.dict.get('file')
+
+    def __str__(self):
+        return pprint.pformat(self.dict)
+
+    def __contains__(self, key):
+        return key in self.dict
+
+    def __getitem__(self, key):
+        return self.dict.get(key, '')
+
+    def __setitem__(self, key, value):
+        self.dict[key] = value
+
+    @staticmethod
+    def from_pdf(pdf):
+        type_guessers = []
+        metadata_readers = {}
+        plugin_did_something = {}
+
+        # Load any plugins that could help parse the PDF file.
+
+        def type_guesser(function):
+            type_guessers.append(function)
+            plugin_did_something['type_guesser'] = True
+            return function
+
+        def metadata_reader(type):
+            def decorator(function):
+                metadata_readers[type] = function
+                plugin_did_something['metadata_reader'] = True
+                return function
+            return decorator
+
+        plugin_scope = {
+                'type_guesser': type_guesser,
+                'metadata_reader': metadata_reader,
+                'pdf_info': get_pdf_info(pdf),
+                'get_pdf_text': get_pdf_text,
+        }
+
+        for file in sorted(glob.glob(PLUGIN_GLOB)):
+            plugin_did_something.clear()
+            execfile(file, plugin_scope)
+            if not plugin_did_something:
+                raise KeyError("The '{}' plugin didn't define type guessers or metadata readers.".format(os.path.abspath(file)))
+
+        # Try to figure out which publisher made this PDF.
+
+        for guesser in type_guessers:
+            type = guesser(pdf)
+            if type is not None:
+                break
+
+        # Fill out a citation using a parser built for this publisher.
+        
+        try: reader = metadata_readers[type]
+        except KeyError: reader = lambda pdf, citation: None
+
+        citation = Citation()
+        citation._current_file = os.path.abspath(pdf)
+        reader(pdf, citation)
+        return citation
+
+    def commit_changes(self):
+
+        # If the file name no longer matches the citation for any reason, 
+        # rename the file.
+
+        self.update_id()
+        updated_file_basename = '{}.pdf'.format(self.id.lower())
+        updated_file = os.path.join(PDF_DIR, updated_file_basename)
+
+        if self._current_file and self._current_file != updated_file:
+            from shutil import copyfile
+            copyfile(self._current_file, updated_file)
+            self._current_file = updated_file
+
+        # Create and return an up-to-date dictionary for the bibtex writer.
+
+        bibtex_dict = self.dict.copy()
+        bibtex_dict['id'] = self.id
+        bibtex_dict['file'] = self.file
+
+        return bibtex_dict
+
+    def update_id(self):
+        import string 
+
+        base_id = updated_id = self.first_author + self.year
+        if base_id == self._current_id: return
+        taken_ids = {
+                citation.id for citation in CitationDatabase()
+                if citation is not self}
+
+        suffixes = list(string.lowercase)
+        while updated_id in taken_ids:
+            updated_id = base_id + suffixes.pop(0)
+
+        self._current_id = updated_id
+
+
+    @property
+    def id(self):
+        return self._current_id or ''
+
+    @property
+    def file(self):
+        return self._current_file or ''
+
+    @property
+    def all_authors(self):
+        authors = []
+        author = collections.namedtuple('author', 'name surname')
+
+        for full_name in self.author.split('and'):
+            try:
+                if ',' in full_name:
+                    surname, name = full_name.split(',', 2)
+                else:
+                    name, surname = full_name.rsplit(None, 2)
+            except:
+                name, surname = '', full_name
+
+            authors.append(author(name, surname))
+
+        return authors
+
+    @property
+    def pretty_authors(self):
+        return ', '.join(x.surname for x in self.all_authors)
+
+    @property
+    def first_author(self):
+        return self.all_authors[0].surname
+
+    @property
+    def last_author(self):
+        return self.all_authors[-1].surname
+
+    @staticmethod
+    def define_field(field, update_id=False):
+        import string
+
+        def getter(self):
+            return self.dict.get(field, '')
+
+        def setter(self, value):
+            self.dict[field] = value
+            if update_id: self.update_id()
+
+        return property(getter, setter)
+
+    define_field = define_field.__func__
+
+
+    author = define_field('author', update_id=True)
+    title = define_field('title')
+    journal = define_field('journal')
+    volume = define_field('volume')
+    pages = define_field('pages')
+    year = define_field('year', update_id=True)
+    month = define_field('month')
+    keywords = define_field('keywords')
+
+@utils.singleton
+class CitationDatabase (object):
+
+    def __init__(self):
+        import bibtexparser
+
+        with open(BIBTEX_FILE) as file:
+            self.bibtex_db = bibtexparser.load(file)
+
+        self.citations = [
+                Citation(entry)
+                for entry in self.bibtex_db.entries]
+
+    def __iter__(self):
+        return iter(self.citations)
+
+    def add_citation(self, citation):
+        self.citations.append(citation)
+
+    def remove_citation(self, citation):
+        self.citations.remove(citation)
+
+    def commit_changes(self):
+        import bibtexparser
+
+        self.bibtex_db.entries = [x.commit_changes() for x in self]
+        self.bibtex_db._entries_dict = {}
+
+        with open(BIBTEX_FILE, 'w') as file:
+            bibtexparser.dump(self.bibtex_db, file)
+
+    def get_possible_dups(self, citation):
+        get_hash = lambda x: (x.first_author, x.year)
+        given_hash = get_hash(citation)
+        return [x for x in self if given_hash == get_hash(x)]
+
+
+class CitationBrowserWindow (gtk.Window):
+
+    def __init__(self):
+        gtk.Window.__init__(self)
+        self.setup_widgets()
+        self.maximize()
+        self.connect('destroy', lambda *args: gtk.main_quit())
+
+    def setup_widgets(self):
+        hpaned = gtk.HPaned()
+        vpaned = gtk.VPaned()
+
+        self.details = CitationDetailsWidget()
+
+        browser_pane = self.setup_browser_pane()
+        search_pane = self.setup_search_pane()
+
+        hpaned.pack1(browser_pane, True)
+        hpaned.pack2(vpaned, False)
+
+        vpaned.pack1(search_pane, False)
+        vpaned.pack2(self.details, True)
+
+        self.add(hpaned)
+        self.show_all()
+
+    def setup_browser_pane(self):
+        model = gtk.TreeStore(object)
+
+        for citation in CitationDatabase():
+            model.append(None, (citation,))
+
+        view = gtk.TreeView(model)
+        text_renderer = gtk.CellRendererText()
+
+        columns = [
+                ('Authors', 'author', True),
+                ('Title', 'title', True),
+                ('Year', 'year', False),
+                ('Journal', 'journal', False),
+        ]
+
+        def cell_data_func(column, cell, model, iter, field):
+            citation = model.get_value(iter, 0)
+            cell.set_property('text', citation[field].replace('\n', ' '))
+            if field == 'author':
+                cell.set_property('ellipsize', pango.ELLIPSIZE_END)
+                cell.set_property('width-chars', 15)
+            if field == 'title':
+                cell.set_property('ellipsize', pango.ELLIPSIZE_END)
+                cell.set_property('width-chars', 35)
+
+        for title, field, expand in columns:
+            text_renderer = gtk.CellRendererText()
+            column = gtk.TreeViewColumn(title, text_renderer)
+            column.set_cell_data_func(text_renderer, cell_data_func, field)
+
+            if expand:
+                #column.set_sizing(gtk.TREE_VIEW_COLUMN_FIXED)
+                #column.set_expand(True)
+                #column.set_min_width(50)
+                #column.set_min_width(50)
+                column.set_expand(True)
+                column.set_resizable(True)
+            else:
+                #column.set_sizing(gtk.TREE_VIEW_COLUMN_AUTOSIZE)
+                column.set_expand(False)
+
+            view.append_column(column)
+
+        scroller = gtk.ScrolledWindow()
+        scroller.set_policy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
+        scroller.add(view)
+
+        def on_select_row(view):
+            model = view.get_model()
+            path, column = view.get_cursor()
+            iter = model.get_iter(path)
+            citation = model.get_value(iter, 0)
+            self.details.set_citation(citation)
+
+        def on_activate_row(view, path, column):
+            iter = model.get_iter(path)
+            citation = model.get_value(iter, 0)
+            evince_pdf(citation.file)
+
+        def on_edit_citation(*args):
+            CitationDatabase().commit_changes()
+
+            # Tell GTK that the tree view need to be updated.
+            model = view.get_model()
+            path, column = view.get_cursor()
+            iter = model.get_iter(path)
+            model.emit('row-changed', path, iter)
+
+        view.connect('cursor-changed', on_select_row)
+        view.connect('row-activated', on_activate_row)
+        self.details.connect('changed', on_edit_citation)
+
+        return scroller
+
+    def setup_search_pane(self):
+        return gtk.Label('Search Pane')
+
+
+class CitationImportDialog (gtk.Window):
+
+    def __init__(self, citation):
+        gtk.Window.__init__(self)
+        self.citation = citation; evince_pdf(citation.file)
+        width = 400; height = 300
+        self.set_default_size(width, height)
+        self.connect('destroy', lambda x: gtk.main_quit())
+        self.setup_widgets()
+
+    def setup_widgets(self):
+        self.details = CitationDetailsWidget(self.citation)
+        self.details.connect('changed', lambda *args: self.update_widgets())
+        self.buttons = self.update_buttons()
+
+        self.vbox = gtk.VBox()
+        self.vbox.pack_start(self.details, expand=True, fill=True)
+        self.vbox.pack_end(self.buttons, expand=False, fill=True)
+
+        self.add(self.vbox)
+        self.show_all()
+
+    def update_widgets(self, ignore_dups=False):
+        self.vbox.remove(self.buttons)
+        self.buttons = self.update_buttons(ignore_dups)
+        self.vbox.pack_end(self.buttons, expand=False, fill=True)
+        self.vbox.show_all()
+
+    def update_buttons(self, ignore_dups=False):
+        citation = self.details.citation
+        possible_dups = CitationDatabase().get_possible_dups(citation)
+
+        if possible_dups and not ignore_dups:
+            message = "Found {} possible duplicates".format(len(possible_dups))
+            status = PdfViewerLink(message, [x.file for x in possible_dups])
+            cancel_button = gtk.Button('Cancel')
+            import_button = gtk.Button('Ignore')
+            import_button.connect('clicked',self.on_ignore_dups_warning)
+            
+        else:
+            status = gtk.Label("Ready to import")
+            cancel_button = gtk.Button('Cancel')
+            import_button = gtk.Button('Import')
+            import_button.connect('clicked', self.on_commit_changes)
+
+        cancel_button.connect('clicked', lambda *args: gtk.main_quit())
+
+        alignment = gtk.Alignment(xalign=0.0, yalign=0.5)
+        alignment.set_padding(0, 0, 5, 5)
+        alignment.add(status)
+
+        frame = gtk.Frame()
+        frame.set_border_width(1)
+        frame.add(alignment)
+
+        hbox = gtk.HBox()
+        hbox.pack_start(frame, expand=True, fill=True)
+        hbox.pack_end(import_button, expand=False, fill=True)
+        hbox.pack_end(cancel_button, expand=False, fill=True)
+
+        return hbox
+
+    def on_ignore_dups_warning(self, *args):
+        self.update_widgets(ignore_dups=True)
+
+    def on_commit_changes(self, *args):
+        CitationDatabase().add_citation(self.details.citation)
+        CitationDatabase().commit_changes()
+        gtk.main_quit()
+
+
+class CitationDetailsWidget (gtk.ScrolledWindow):
+
+    __gsignals__ = {
+            'changed' : (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, ()),
+    }
+
+    def __init__(self, citation=None):
+        gtk.ScrolledWindow.__init__(self)
+        self.citation = citation
+        self.widgets = {}
+        self.signals = []
+
+        class Field:
+            def __init__(self, key, label=None, stretch=False, join=False):
+                self.key = key
+                self.label = label or key.title()
+                self.stretch = stretch
+                self.join = join
+
+        self.fields = [
+                Field('author', label='Authors'),
+                Field('title'),
+                Field('abstract', stretch=True),
+                Field('annote', label='Notes', stretch=True),
+                Field('journal'),
+                Field('volume'), Field('pages', join=True),
+                Field('month'), Field('year', join=True),
+        ]
+
+        self.setup_widgets()
+
+    def set_citation(self, citation):
+        self.citation = citation
+        self.update_table()
+
+    def setup_widgets(self):
+        table = self.setup_table()
+
+        viewport = gtk.Viewport()
+        viewport.add(table)
+        viewport.set_shadow_type(gtk.SHADOW_NONE)
+
+        self.add(viewport)
+        self.set_policy(gtk.POLICY_NEVER, gtk.POLICY_AUTOMATIC)
+        self.set_shadow_type(gtk.SHADOW_NONE)
+        self.show_all()
+
+    def setup_table(self):
+        matrix = []
+
+        for field in self.fields:
+            if not field.join: matrix.append([field])
+            else: matrix[-1].append(field)
+
+        num_rows = len(matrix)
+        num_cols = 2 * max(len(row) for row in matrix)
+
+        table = gtk.Table(num_rows, num_cols)
+        table.set_row_spacings(2)
+        table.set_col_spacings(2)
+        table.set_border_width(2)
+
+        for row, fields in enumerate(matrix):
+            for col, field in enumerate(fields):
+                label = gtk.Label(field.label)
+                alignment = gtk.Alignment(xalign=0.0, yalign=0.0)
+                alignment.set_padding(4, 2, 2, 7)
+                alignment.add(label)
+                table.attach(alignment, 2*col, 2*col+1, row, row+1,
+                        xoptions=gtk.FILL, yoptions=gtk.FILL)
+
+                entry = self.widgets[field.key] = MultilineEntry()
+                yoptions = gtk.FILL | (gtk.EXPAND if field.stretch else 0)
+                end_col = 2*col+2 if col != len(fields) - 1 else num_cols
+                table.attach(entry, 2*col+1, end_col, row, row+1,
+                        xoptions=gtk.FILL|gtk.EXPAND, yoptions=yoptions)
+
+        self.update_table()
+
+        for key in self.widgets:
+            buffer = self.widgets[key].buffer
+            handler_id = buffer.connect('changed', self.on_edit_citation)
+            self.signals.append((buffer, handler_id))
+
+        return table
+
+    def update_table(self):
+        if self.citation:
+            for widget, handler_id in self.signals:
+                widget.handler_block(handler_id)
+
+            for field in self.fields:
+                self.widgets[field.key].set_text(self.citation[field.key])
+
+            for widget, handler_id in self.signals:
+                widget.handler_unblock(handler_id)
+        else:
+            if self.get_child():
+                self.get_child().hide_all()
+
+    def on_edit_citation(self, *args):
+        for field in self.fields:
+            self.citation[field.key] = self.widgets[field.key].get_text()
+        self.emit('changed')
+
+
+@utils.singleton
+class PluginDatabase (object):
+    pass
+
+@utils.singleton
+class TopicDatabase (object):
+    pass
+
+class MultilineEntry (gtk.EventBox):
+
+    def __init__(self):
+        gtk.EventBox.__init__(self)
+
+        self.textview = gtk.TextView()
+        self.textview.set_wrap_mode(gtk.WRAP_WORD)
+
+        padding = gtk.EventBox()
+        padding.add(self.textview)
+        padding.set_border_width(2)
+
+        self.modify_bg(gtk.STATE_NORMAL, gtk.gdk.color_parse('white'))
+        self.add(padding)
+
+    @property
+    def buffer(self):
+        return self.textview.get_buffer()
+
+    def get_text(self):
+        return self.buffer.get_text(
+                self.buffer.get_start_iter(),
+                self.buffer.get_end_iter())
+
+    def set_text(self, value):
+        self.buffer.set_text(value)
+
+
+class PdfViewerLink (gtk.EventBox):
+
+    def __init__(self, text, pdf_or_pdfs):
+        gtk.EventBox.__init__(self)
+
+        if isinstance(pdf_or_pdfs, str):
+            self.pdfs = [pdf_or_pdfs]
+        else:
+            self.pdfs = pdf_or_pdfs
+
+        label = gtk.Label()
+        label.set_markup('<span foreground="blue" underline="single">{}</span>'.format(text))
+
+        self.add(label)
+        self.set_events(gtk.gdk.BUTTON_PRESS_MASK)
+        self.connect("button_press_event", self.on_clicked)
+        self.connect('realize', lambda *args:
+                self.window.set_cursor(gtk.gdk.Cursor(gtk.gdk.HAND1)))
+
+    def on_clicked(self, *args):
+        for pdf in self.pdfs:
+            evince_pdf(pdf)
+
+
+
+def get_pdf_info(pdf):
+    from pdfminer.pdfparser import PDFParser
+    from pdfminer.pdfdocument import PDFDocument
+
+    with open(pdf, 'rb') as file:
+        parser = PDFParser(file)
+        document = PDFDocument(parser)
+        return document.info[0] if document.info else {}
+
+def get_pdf_text(pdf):
+    from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+    from pdfminer.converter import TextConverter
+    from pdfminer.layout import LAParams
+    from pdfminer.pdfpage import PDFPage
+    from cStringIO import StringIO
+
+    # This code was written by czw and published on StackOverflow:
+    # http://stackoverflow.com/questions/5725278/python-help-using-pdfminer-as-a-library
+
+    rsrcmgr, laparams, retstr = PDFResourceManager(), LAParams(), StringIO()
+    device = TextConverter(rsrcmgr, retstr, codec='utf-8', laparams=laparams)
+    interpreter = PDFPageInterpreter(rsrcmgr, device)
+
+    with open(pdf, 'rb') as fp:
+        for page in PDFPage.get_pages(fp, set()):
+            interpreter.process_page(page)
+
+    device.close()
+    str = retstr.getvalue()
+    retstr.close()
+    return str
+
+def get_first_author(bibtex_str):
+    first_author = bibtex_str.partition('and')[0]
+    first_author_words = first_author.split()
+
+    if ',' in first_author_words:
+        return first_author_words[0]
+    else:
+        return first_author_words[-1]
+
+def evince_pdf(pdf):
+    from subprocess import Popen
+    command = 'evince', pdf
+    process = Popen(command)
+
+
+if __name__ == '__main__':
+    try:
+        import logging
+        logging.basicConfig()
+
+        from docopt import docopt
+        arguments = docopt(__doc__)
+
+        if arguments['<pdf>']:
+            citation = Citation.from_pdf(arguments['<pdf>'])
+            gui = CitationImportDialog(citation)
+            gtk.main()
+        else:
+            gui = CitationBrowserWindow()
+            gtk.main()
+
+    except KeyboardInterrupt:
+        print
+
